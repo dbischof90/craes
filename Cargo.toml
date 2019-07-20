@@ -1,13 +1,21 @@
 [package]
-name = "tokio_tunsgt_example"
-version = "0.1.0"
-authors = ["daniel"]
+name = "craes"
+version = "0.0.1"
+authors = ["Daniel Bischof <daniel.bischof@protonmail.com>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+build = "build.rs"
+publish = false
 
 [dependencies]
 tokio = "*"
+tracing = "*" 
+tracing-futures = {path = "../tracing/tracing-futures"}
+tracing-fmt = {path = "../tracing/tracing-fmt"}
 futures = "*"
 tungstenite = "*"
 tokio-tungstenite = "*"
+capnp = "*"
+capnp-futures = "*"
+
+[build-dependencies]
+capnpc = "*"
