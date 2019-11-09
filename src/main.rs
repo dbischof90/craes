@@ -23,26 +23,31 @@ pub mod ordermsg_capnp {
 }
 
 mod order;
+mod orderbook;
+
+type OrderReaderError = sync::mpsc::SendError<(
+    capnp::message::TypedReader<
+        capnp_futures::serialize::OwnedSegments,
+        ordermsg_capnp::order_msg::Owned,
+    >,
+    sync::oneshot::Sender<std::result::Result<(), AssetHandlingError>>,
+)>;
 
 #[derive(Debug)]
-enum MyError {
+enum ServerError {
     OneshotCancelled(sync::oneshot::Canceled),
-    PipelineError(sync::mpsc::SendError<(capnp::message::TypedReader::<
-                                         capnp_futures::serialize::OwnedSegments,
-                                         ordermsg_capnp::order_msg::Owned,
-                                         >, sync::oneshot::Sender<std::result::Result<(), AssetHandlingError>>)>),
-                                         WebSocketError(Error),
-                                         DeserializationError(capnp::Error),
-                                         AssetHandlingError(AssetHandlingError)
+    PipelineError(OrderReaderError),
+    WebSocketError(Error),
+    DeserializationError(capnp::Error),
+    AssetHandlingError(AssetHandlingError),
+    ResponseError(sync::mpsc::SendError<tungstenite::protocol::Message>),
 }
-
 
 #[derive(Debug)]
 enum AssetHandlingError {
     PhantomError(()),
-    DeserializationError(capnp::Error)
+    DeserializationError(capnp::Error),
 }
-
 
 fn main() {
     let server_addr = env::args()
@@ -53,27 +58,31 @@ fn main() {
 
     let socket = TcpListener::bind(&server_addr).unwrap();
 
-    debug!("Listening on: {}", server_addr);
+    println!("Listening on: {}", server_addr);
     let mut threadpool = tokio::runtime::Runtime::new().unwrap();
     let mut addr_maps = HashMap::new();
 
     for i in 0..3 {
-        let (numberchannel_tx, numberchannel_rx) =
-            sync::mpsc::channel::<(capnp::message::TypedReader::<
-                                   capnp_futures::serialize::OwnedSegments,
-                                   ordermsg_capnp::order_msg::Owned,
-                                   >, sync::oneshot::Sender<std::result::Result<(), AssetHandlingError>>)>(0);
+        let (numberchannel_tx, numberchannel_rx) = sync::mpsc::channel::<(
+            capnp::message::TypedReader<
+                capnp_futures::serialize::OwnedSegments,
+                ordermsg_capnp::order_msg::Owned,
+            >,
+            sync::oneshot::Sender<std::result::Result<(), AssetHandlingError>>,
+        )>(0);
         addr_maps.insert(i, numberchannel_tx);
+        let mut ob = orderbook::Orderbook::new(i.to_string());
 
         let handle_asset = numberchannel_rx
             .map_err(AssetHandlingError::PhantomError)
             .and_then(|(typed_reader, os_tx)| {
-
                 let order_reader = match typed_reader.get() {
                     Ok(r) => r,
                     Err(e) => {
-                        os_tx.send(Err(AssetHandlingError::DeserializationError(e.clone()))).expect("Router was dropped!");
-                        return Err(AssetHandlingError::DeserializationError(e))
+                        os_tx
+                            .send(Err(AssetHandlingError::DeserializationError(e.clone())))
+                            .expect("Router was dropped!");
+                        return Err(AssetHandlingError::DeserializationError(e));
                     }
                 };
 
@@ -101,19 +110,17 @@ fn main() {
                     order_reader.get_volume(),
                     limitprice,
                     ordercondition,
-                    );
-
+                );
 
                 Ok((order_to_process, os_tx))
             })
-        .for_each(|(j, os_tx)| {
-
-
-
-            println!("I received {:#?} for asset !", &j);
-            os_tx.send(Ok(())).unwrap();
-            Ok(())
-        });
+            .for_each(move |(j, os_tx)| {
+                println!("Order: {:#?}", j);
+                let trades = ob.resolve_order(j);
+                println!("Trades: {:#?}", trades);
+                os_tx.send(Ok(())).unwrap();
+                Ok(())
+            });
 
         threadpool.spawn(handle_asset.map_err(drop));
     }
@@ -123,75 +130,79 @@ fn main() {
     let srv = socket
         .incoming()
         .map_err(|e| {
-            error!(msg = "Error accepting socket", error = field::display(&e));
+            //println!(msg = "Error accepting socket", error = field::display(&e));
             panic!("Error accepting socket");
         })
-    .map(move |stream| {
-        let addr = stream.peer_addr().unwrap();
-        let conn_for_client = connections.clone();
-        accept_async(stream)
-            .map_err(|e| error!(msg = "Handshake failed", error = field::display(&e)))
-            .and_then(move |ws_stream| {
-                info!("New connection from {}", addr);
-                let (response_to_client, order_stream) = ws_stream.split();
-                let (tx, rx) = sync::mpsc::unbounded();
+        .map(move |stream| {
+            let addr = stream.peer_addr().unwrap();
+            let conn_for_client = connections.clone();
+            accept_async(stream)
+                .map_err(|e| println!("Handshake failed: {:#?}", e))
+                .and_then(move |ws_stream| {
+                    println!("New connection from {}", addr);
+                    let (response_to_client, order_stream) = ws_stream.split();
+                    let (tx, rx) = sync::mpsc::unbounded();
 
-                let handle_msgs = order_stream
-                    .map_err(|e| {
-                        error!(msg = "Handshake failed", error = field::display(&e));
-                        MyError::WebSocketError(e)
-                    })
-                .filter_map(|msg| match msg {
-                    tungstenite::protocol::Message::Binary(load) => Some(load),
-                    _ => None,
-                })
-                .and_then(move |load| {
-                    capnp_futures::serialize::read_message(
-                        std::io::Cursor::new(load),
-                        capnp::message::ReaderOptions::new(),
-                        )
-                        .map_err(MyError::DeserializationError)
-                })
-                .filter_map(|(_, root_cont_opt)| root_cont_opt)
-                    .map(
-                        capnp::message::TypedReader::<
-                        capnp_futures::serialize::OwnedSegments,
-                        ordermsg_capnp::order_msg::Owned,
-                        >::from
-                        )
-                    .and_then(move |msg| {
-                        let (tx_os, rx_os) = futures::sync::oneshot::channel::<std::result::Result<(), AssetHandlingError>>();
-                        let tx_local = conn_for_client.read().unwrap().get(&1).unwrap().clone();
-                        tx_local
-                            .send((msg, tx_os))
-                            .map_err(MyError::PipelineError)
-                            .and_then(move |_| rx_os.map_err(MyError::OneshotCancelled))
-                    })
-                .then(move |reply| {
-                    let x = reply.unwrap().unwrap(); //Yeah, stuffy-stuff here.
-                    tx.unbounded_send(tungstenite::Message::text("And back!"))
-                })
-                .for_each(|_| Ok(()));
-
-                handle_msgs
-                    .map(drop)
-                    .map_err(drop)
-                    .join(
-                        response_to_client
-                        .send_all(
-                            rx.map_err(|e| std::io::Error::from(std::io::ErrorKind::Other)),
+                    let handle_msgs = order_stream
+                        .map_err(|e| ServerError::WebSocketError(e))
+                        .filter_map(|msg| match msg {
+                            tungstenite::protocol::Message::Binary(load) => Some(load),
+                            _ => None,
+                        })
+                        .and_then(move |load| {
+                            capnp_futures::serialize::read_message(
+                                std::io::Cursor::new(load),
+                                capnp::message::ReaderOptions::new(),
                             )
-                        .map(drop)
-                        .map_err(drop),
+                            .map_err(ServerError::DeserializationError)
+                        })
+                        .filter_map(|(_, root_cont_opt)| root_cont_opt)
+                        .map(
+                            capnp::message::TypedReader::<
+                                capnp_futures::serialize::OwnedSegments,
+                                ordermsg_capnp::order_msg::Owned,
+                            >::from,
                         )
-                    .and_then(move |(_, _)| {
-                        info!("Connection {} closed.", addr);
-                        Ok(())
-                    })
-            })
-        .instrument(span!(Level::TRACE, "client_to_server"))
-    })
-    .buffer_unordered(1000)
+                        .and_then(move |msg| {
+                            let (tx_os, rx_os) = futures::sync::oneshot::channel::<
+                                std::result::Result<(), AssetHandlingError>,
+                            >();
+                            let tx_local = conn_for_client.read().unwrap().get(&1).unwrap().clone();
+                            tx_local
+                                .send((msg, tx_os))
+                                .map_err(ServerError::PipelineError)
+                                .and_then(move |_| rx_os.map_err(ServerError::OneshotCancelled))
+                        })
+                        .and_then(move |reply| {
+                            println!("At the end: {:#?}", reply);
+                            //let x = reply.unwrap().unwrap(); //Yeah, stuffy-stuff here.
+                            match reply {
+                                Ok(x) => tx
+                                    .unbounded_send(tungstenite::Message::text("And back!"))
+                                    .map_err(ServerError::ResponseError)
+                                    .map(|x| Some(())),
+                                Err(x) => Ok(None),
+                            }
+                        })
+                        .for_each(|_| Ok(()));
+
+                    handle_msgs
+                        .or_else(|_| Ok(()))
+                        .join(
+                            response_to_client
+                                .send_all(
+                                    rx.map_err(|e| std::io::Error::from(std::io::ErrorKind::Other)),
+                                )
+                                .map(drop)
+                                .map_err(drop),
+                        )
+                        .and_then(move |(_, _)| {
+                            println!("Connection {} closed.", addr);
+                            Ok(())
+                        })
+                })
+        })
+        .buffer_unordered(1000)
         .for_each(|_| Ok(()));
 
     let subscriber = tracing_fmt::FmtSubscriber::builder().finish();
