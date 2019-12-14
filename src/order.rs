@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::option::Option;
-use std::time::SystemTime;
+use chrono::{Local, DateTime};
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum OrderCondition {
@@ -15,8 +15,8 @@ pub struct Order {
     pub buy: bool,
     pub volume: i32,
     pub limit_price: Option<i32>,
-    pub created_at: SystemTime,
-    pub filled_at: Option<SystemTime>,
+    pub created_at: DateTime<Local>,
+    pub filled_at: Option<DateTime<Local>>,
     pub condition: OrderCondition,
 }
 
@@ -33,7 +33,7 @@ impl Order {
             buy,
             limit_price,
             volume,
-            created_at: SystemTime::now(),
+            created_at: Local::now(),
             filled_at: None,
             condition,
         }
@@ -41,7 +41,7 @@ impl Order {
 
     #[inline]
     pub fn fill(&mut self) {
-        self.filled_at = Some(SystemTime::now());
+        self.filled_at = Some(Local::now());
     }
 
     #[inline]
