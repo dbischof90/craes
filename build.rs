@@ -3,7 +3,7 @@ use capnpc;
 fn main() {
     capnpc::CompilerCommand::new()
         .src_prefix("schema")
-        .file("schema/ordermsg.capnp")
+        .file("schema/protocol.capnp")
         .run()
         .expect("Compiling schema");
 }

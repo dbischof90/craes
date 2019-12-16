@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::iter::FromIterator;
 use std::sync::{atomic, Arc, Mutex, RwLock};
 
 use http;
@@ -14,176 +13,47 @@ use futures::{
 };
 
 use tokio::net::TcpListener;
-use tokio_threadpool::{blocking, BlockingError};
+use tokio_threadpool::blocking;
 
 use capnp;
 use capnp_futures;
-use tokio_postgres;
-use tokio_tungstenite::accept_hdr_async;
-use tungstenite::{
-    error::Error,
-    handshake::server::{ErrorResponse, Request},
-};
 
+use tokio_tungstenite::accept_hdr_async;
+use tungstenite::handshake::server::{ErrorResponse, Request};
+
+use tracing;
+use tracing::{debug, error, info, span, trace, warn, Level};
+use tracing_futures::Instrument;
+use tracing_subscriber::fmt;
+
+mod database;
+mod errors;
 mod order;
 mod orderbook;
-mod ordermsg_capnp {
-    include!(concat!(env!("OUT_DIR"), "/ordermsg_capnp.rs"));
+mod protocol_capnp {
+    include!(concat!(env!("OUT_DIR"), "/protocol_capnp.rs"));
 }
 
-type OrderReaderError = sync::mpsc::SendError<(
-    order::Order,
-    sync::oneshot::Sender<std::result::Result<std::vec::Vec<order::Order>, AssetHandlingError>>,
-)>;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let subscriber = fmt::Subscriber::builder()
+        .with_max_level(Level::TRACE)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
-#[derive(Debug)]
-enum ServerError {
-    OneshotCancelled(sync::oneshot::Canceled),
-    PipelineError(OrderReaderError),
-    WebSocketError(Error),
-    DeserializationError(capnp::Error),
-    AssetHandlingError(AssetHandlingError),
-    ResponseError(sync::mpsc::SendError<tungstenite::protocol::Message>),
-}
-
-#[derive(Debug)]
-enum AssetHandlingError {
-    PhantomError(()),
-    RouterHasShutDown,
-    OrderbookInsertError(BlockingError),
-    SendingToDatabase(DatabaseChannelError),
-}
-
-#[derive(Debug)]
-enum DatabaseChannelError {
-    Trades(sync::mpsc::SendError<HashMap<order::Order, Vec<order::Order>>>),
-    Orders(sync::mpsc::SendError<order::Order>),
-}
-
-#[derive(Debug)]
-enum DatabaseError {
-    ClientError(tokio_postgres::error::Error),
-    ChannelError(()),
-}
-
-#[derive(Debug)]
-struct Setup {
-    asset_ids: std::vec::Vec<u16>,
-    auth_pairs: std::collections::HashMap<String, String>,
-    max_order_id_at_boot: i32,
-}
-
-fn copy_into_database<S>(
-    table_name: String,
-    lines_stream: S,
-    threadpool: &mut tokio::runtime::Runtime,
-) where
-    S: Stream<Item = std::vec::Vec<u8>, Error = DatabaseError> + Send + 'static,
-{
-    let executor_handle = threadpool.executor();
-    let fut = tokio_postgres::connect(
-        "host=router user=postgres dbname=craes",
-        tokio_postgres::NoTls,
-    )
-    .map(move |(client, connection)| {
-        let connection = connection.map_err(|e| eprintln!("connection error: {}", e));
-        executor_handle.spawn(connection);
-        client
-    })
-    .and_then(move |mut client| {
-        client
-            .prepare(&["COPY ", &table_name, " FROM STDIN"].concat())
-            .map(|statement| (client, statement))
-    })
-    .map_err(DatabaseError::ClientError)
-    .and_then(|(mut client, statement)| {
-        lines_stream
-            .chunks(1)
-            .and_then(move |prepared_rows| {
-                let stream_rows = iter_ok::<_, std::io::Error>(prepared_rows);
-                client
-                    .copy_in(&statement, &[], stream_rows)
-                    .map_err(DatabaseError::ClientError)
-            })
-            .for_each(|_| Ok(()))
-    });
-
-    threadpool.spawn(fut.map_err(drop));
-}
-
-fn setup_from_database() -> Setup {
-    let mut temporary_runtime = tokio::runtime::Runtime::new().unwrap();
-    let executor_handle = temporary_runtime.executor();
-    let fut = tokio_postgres::connect(
-        "host=router user=postgres dbname=craes",
-        tokio_postgres::NoTls,
-    )
-    .map(move |(client, connection)| {
-        let connection = connection.map_err(|e| eprintln!("connection error: {}", e));
-        executor_handle.spawn(connection);
-        client
-    })
-    .and_then(move |mut client| {
-        let asset_id_prep = client.prepare("SELECT name FROM asset_info");
-        let auth_pairs_prep = client.prepare("SELECT username, passphrase FROM user_info");
-        let max_order_id_prep = client.prepare("SELECT MAX(id) FROM orders");
-        asset_id_prep.join3(auth_pairs_prep, max_order_id_prep).map(
-            |(asset_id_prep, auth_pairs_prep, max_order_id_prep)| {
-                (client, asset_id_prep, auth_pairs_prep, max_order_id_prep)
-            },
-        )
-    })
-    .map_err(DatabaseError::ClientError)
-    .and_then(
-        |(mut client, asset_id_stmt, auth_pairs_stmt, max_order_id_stmt)| {
-            let asset_id_res = client
-                .query(&asset_id_stmt, &[])
-                .collect()
-                .map(|rows| rows.into_iter().map(|row| row.get::<_, i32>(0) as u16))
-                .map_err(DatabaseError::ClientError);
-
-            let auth_pairs_res = client
-                .query(&auth_pairs_stmt, &[])
-                .collect()
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
-                })
-                .map_err(DatabaseError::ClientError);
-
-            let max_order_id_res = client
-                .query(&max_order_id_stmt, &[])
-                .collect()
-                .map(|rows| rows[0].get::<_, i32>(0))
-                .map_err(DatabaseError::ClientError);
-
-            (asset_id_res, auth_pairs_res, max_order_id_res)
-        },
-    );
-    let (asset_id, auth_pairs, max_order_id) = temporary_runtime.block_on(fut).unwrap();
-
-    Setup {
-        asset_ids: asset_id.collect(),
-        auth_pairs: std::collections::HashMap::from_iter(auth_pairs),
-        max_order_id_at_boot: max_order_id,
-    }
-}
-
-fn main() {
     let server_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string())
         .parse()
         .unwrap();
 
-    let Setup {
+    let database::Setup {
         asset_ids,
         auth_pairs,
         max_order_id_at_boot,
-    } = setup_from_database();
+    } = database::setup_from_database();
     let socket = TcpListener::bind(&server_addr).unwrap();
 
-    println!("Listening on: {}", server_addr);
+    info!("CRAES started, listening on: {}", server_addr);
     let mut threadpool = tokio::runtime::Runtime::new().unwrap();
     let mut addr_maps = HashMap::new();
     let order_id = Arc::new(atomic::AtomicI32::new(max_order_id_at_boot + 1));
@@ -198,14 +68,17 @@ fn main() {
                 received_order.id.to_string(),
                 received_order.buy.to_string(),
                 received_order.volume.to_string(),
-                received_order.limit_price.unwrap_or(0).to_string(), //TODO: fix...
+                match received_order.limit_price {
+                    Some(price) => price.to_string(),
+                    None => "".to_string(),
+                },
                 received_order.created_at.to_rfc3339(),
             ]
             .join("\t");
             buf.push('\n');
             buf.into_bytes()
         })
-        .map_err(DatabaseError::ChannelError);
+        .map_err(errors::DatabaseError::ChannelError);
 
     let trade_processing = dbchannel_rx
         .map(
@@ -235,30 +108,28 @@ fn main() {
             },
         )
         .flatten()
-        .map_err(DatabaseError::ChannelError);
+        .map_err(errors::DatabaseError::ChannelError);
 
-    copy_into_database("trades".to_string(), trade_processing, &mut threadpool);
-    copy_into_database("orders".to_string(), order_processing, &mut threadpool);
+    database::copy_into_database("trades".to_string(), trade_processing, &mut threadpool);
+    database::copy_into_database("orders".to_string(), order_processing, &mut threadpool);
 
-    println!("Setting up with {:#?}, {:#?}.", asset_ids, auth_pairs);
-    //TODO: Set up orderbooks from database.
     for i in asset_ids.into_iter() {
         let dbchannel_tx_local = dbchannel_tx.clone();
         let order_db_tx_local = order_db_tx.clone();
         let (assetchannel_tx, assetchannel_rx) = sync::mpsc::channel::<(
             order::Order,
             sync::oneshot::Sender<
-                std::result::Result<std::vec::Vec<order::Order>, AssetHandlingError>,
+                std::result::Result<std::vec::Vec<order::Order>, errors::AssetHandlingError>,
             >,
         )>(0);
         addr_maps.insert(i, assetchannel_tx);
         let ob = Arc::new(Mutex::new(orderbook::Orderbook::new(i.to_string())));
 
         let handle_asset = assetchannel_rx
-            .map_err(AssetHandlingError::PhantomError)
+            .map_err(errors::AssetHandlingError::PhantomError)
             .and_then(move |(order_to_process, os_tx)| {
                 let local_orderbook = ob.clone();
-                println!("Orderbook: {:#?}", ob);
+                debug!("Receiving order: {:?}", order_to_process);
                 future::poll_fn(move || {
                     blocking(|| {
                         //TODO: Can this or should this be able to fail controlled?
@@ -268,28 +139,33 @@ fn main() {
                             .resolve_order(order_to_process)
                     })
                 })
-                .map_err(AssetHandlingError::OrderbookInsertError)
+                .map_err(errors::AssetHandlingError::OrderbookInsertError)
                 .map(move |trades| (order_to_process, trades, os_tx))
             })
             .for_each(move |(processed_order, trades, os_tx)| {
-                println!("Trades: {:#?}", trades);
                 let own_executed_trades = match trades.get(&processed_order) {
                     Some(t) => t.clone(),
                     None => std::vec::Vec::new(),
                 };
+                debug!(
+                    "Order triggered {} trades for client.",
+                    own_executed_trades.len()
+                );
 
                 let sent_back = match dbchannel_tx_local
                     .unbounded_send(trades)
                     .map_err(|e| {
-                        AssetHandlingError::SendingToDatabase(DatabaseChannelError::Trades(e))
+                        errors::AssetHandlingError::SendingToDatabase(
+                            errors::DatabaseChannelError::Trades(e),
+                        )
                     })
                     .and_then(|_| {
                         order_db_tx_local
                             .unbounded_send(processed_order)
                             .map_err(|e| {
-                                AssetHandlingError::SendingToDatabase(DatabaseChannelError::Orders(
-                                    e,
-                                ))
+                                errors::AssetHandlingError::SendingToDatabase(
+                                    errors::DatabaseChannelError::Orders(e),
+                                )
                             })
                     }) {
                     Ok(_) => os_tx.send(Ok(own_executed_trades)),
@@ -298,13 +174,14 @@ fn main() {
 
                 if let Err(on_db_channel_fail) = sent_back {
                     match on_db_channel_fail {
-                        Ok(_) => Err(AssetHandlingError::PhantomError(())),
-                        Err(_e) => Err(AssetHandlingError::RouterHasShutDown),
+                        Ok(_) => Err(errors::AssetHandlingError::PhantomError(())),
+                        Err(_e) => Err(errors::AssetHandlingError::RouterHasShutDown),
                     }
                 } else {
                     Ok(())
                 }
-            });
+            })
+            .instrument(span!(Level::TRACE, "Order book", "Asset: {}", i));
 
         threadpool.spawn(handle_asset.map_err(drop));
     }
@@ -314,8 +191,8 @@ fn main() {
 
     let srv = socket
         .incoming()
-        .map_err(|_e| {
-            // TODO: Include in logs.
+        .map_err(|e| {
+            error!("Not able to accept socket: {}", e);
             panic!("Error accepting socket");
         })
         .map(move |stream| {
@@ -324,15 +201,7 @@ fn main() {
             let order_id_local = order_id.clone();
             let shared_auth_pairs_local = shared_auth_pairs.clone();
 
-            // TODO: Client authentification
             accept_hdr_async(stream, move |req: &Request| {
-                println!("Received a new ws handshake");
-                println!("The request's path is: {}", req.path);
-                println!("The request's headers are:");
-                for &(ref header, ref value /* value */) in req.headers.iter() {
-                    println!("* {}: {:?}", header, value);
-                }
-
                 let headers = &req.headers;
                 let username = headers.find_first("User");
                 let passphrase = headers.find_first("Password");
@@ -352,16 +221,17 @@ fn main() {
                     }
                 }
                 base_error.headers = Some(vec![(auth_resp, String::from("Wrong credentials"))]);
+                error!("Failed connection attempt from {}", req.path);
                 Err(base_error)
             })
-            .map_err(|e| println!("Handshake failed: {:#?}", e))
+            .map_err(|e| error!("Handshake failed: {:#?}", e))
             .and_then(move |ws_stream| {
-                println!("New connection from {}", addr);
+                info!("Client registering at {}", &addr);
                 let (response_to_client, order_stream) = ws_stream.split();
                 let (tx, rx) = sync::mpsc::unbounded();
 
                 let handle_msgs = order_stream
-                    .map_err(ServerError::WebSocketError)
+                    .map_err(errors::ServerError::WebSocketError)
                     .filter_map(|msg| match msg {
                         tungstenite::protocol::Message::Binary(load) => Some(load),
                         _ => None,
@@ -371,28 +241,28 @@ fn main() {
                             std::io::Cursor::new(load),
                             capnp::message::ReaderOptions::new(),
                         )
-                        .map_err(ServerError::DeserializationError)
+                        .map_err(errors::ServerError::DeserializationError)
                     })
                     .filter_map(|(_, root_cont_opt)| root_cont_opt)
                     .map(
                         capnp::message::TypedReader::<
                             capnp_futures::serialize::OwnedSegments,
-                            ordermsg_capnp::order_msg::Owned,
+                            protocol_capnp::order_msg::Owned,
                         >::from,
                     )
                     .and_then(move |typed_reader| {
                         let order_reader = match typed_reader.get() {
                             Ok(r) => r,
-                            Err(e) => return Err(ServerError::DeserializationError(e)),
+                            Err(e) => return Err(errors::ServerError::DeserializationError(e)),
                         };
 
                         let asset_id = order_reader.get_assetname();
 
                         let ordercondition = match order_reader.get_condition().which() {
-                            Ok(ordermsg_capnp::order_msg::condition::Which::Unconditional(())) => {
+                            Ok(protocol_capnp::order_msg::condition::Which::Unconditional(())) => {
                                 order::OrderCondition::Unconditional
                             }
-                            Ok(ordermsg_capnp::order_msg::condition::Which::Stoporder(val)) => {
+                            Ok(protocol_capnp::order_msg::condition::Which::Stoporder(val)) => {
                                 order::OrderCondition::Stop {
                                     stop: val.get_stop(),
                                 }
@@ -401,8 +271,8 @@ fn main() {
                         };
 
                         let limitprice = match order_reader.get_limitprice().which() {
-                            Ok(ordermsg_capnp::order_msg::limitprice::Which::None(())) => None,
-                            Ok(ordermsg_capnp::order_msg::limitprice::Which::Some(val)) => {
+                            Ok(protocol_capnp::order_msg::limitprice::Which::None(())) => None,
+                            Ok(protocol_capnp::order_msg::limitprice::Which::Some(val)) => {
                                 Some(val)
                             }
                             _ => None,
@@ -415,12 +285,14 @@ fn main() {
                             limitprice,
                             ordercondition,
                         );
-                        println!("going in: {:#?}", order_to_process);
                         Ok((order_to_process, asset_id))
                     })
                     .and_then(move |(order_to_process, asset_id)| {
                         let (tx_os, rx_os) = futures::sync::oneshot::channel::<
-                            std::result::Result<std::vec::Vec<order::Order>, AssetHandlingError>,
+                            std::result::Result<
+                                std::vec::Vec<order::Order>,
+                                errors::AssetHandlingError,
+                            >,
                         >();
                         let tx_local = conn_for_client
                             .read()
@@ -430,16 +302,19 @@ fn main() {
                             .clone();
                         tx_local
                             .send((order_to_process, tx_os))
-                            .map_err(ServerError::PipelineError)
-                            .and_then(move |_| rx_os.map_err(ServerError::OneshotCancelled))
+                            .map_err(errors::ServerError::PipelineError)
+                            .and_then(move |_| rx_os.map_err(errors::ServerError::OneshotCancelled))
                     })
-                    .and_then(|response| response.map_err(ServerError::AssetHandlingError))
+                    .and_then(|response| response.map_err(errors::ServerError::AssetHandlingError))
                     .and_then(|trades| {
-                        println!("At the end: {:#?}", trades);
-                        //TODO: Write response protocol.
+                        if !trades.is_empty() {
+                            trace!("Trades to be sent: {:?}", trades);
+                        } else {
+                            trace!("No trades executed.");
+                        }
                         let mut response_builder = capnp::message::Builder::new_default();
                         let response_msg =
-                            response_builder.init_root::<ordermsg_capnp::response_msg::Builder>();
+                            response_builder.init_root::<protocol_capnp::response_msg::Builder>();
                         let mut executed_trades_writer =
                             response_msg.init_executedtrades(trades.len() as u32);
                         for (i, order) in trades.iter().enumerate() {
@@ -452,31 +327,37 @@ fn main() {
                             std::io::Cursor::new(std::vec::Vec::new()),
                             response_builder,
                         )
-                        .map_err(ServerError::DeserializationError)
+                        .map_err(errors::ServerError::DeserializationError)
                     })
                     .and_then(move |(buffer, _)| {
-                        println!("sending: {:?}", buffer);
                         tx.unbounded_send(tungstenite::Message::binary(buffer.into_inner()))
-                            .map_err(ServerError::ResponseError)
+                            .map_err(errors::ServerError::ResponseError)
                     })
-                    .for_each(|_| Ok(()));
+                    .for_each(|_| Ok(()))
+                    .instrument(span!(Level::DEBUG, "Order processor", "Client: {}", addr));
 
                 handle_msgs
                     .or_else(|e| {
-                        eprintln!("{:#?}", e);
+                        error!("Error in order process: {:?}", e);
                         Ok(())
                     }) // TODO: handle_msgs fails as expected if client just 'drops' connection. Handle case!
                     .join(
-                        response_to_client.send_all(rx.map_err(|_e| {
-                            eprintln!("{:#?}", _e);
+                        response_to_client.send_all(rx.map_err(|_| {
+                            warn!("No response handler found, dropping task.");
                             std::io::Error::from(std::io::ErrorKind::Other)
                         })), //.map_err(drop), //TODO: figure out case in which no response handler exists!
                     )
                     .and_then(move |(_, _)| {
-                        println!("Connection {} closed.", addr);
+                        info!("Connection to {} closed.", addr);
                         Ok(())
                     })
-                    .or_else(|_e| Ok(())) //TODO: Logging this!
+                    .or_else(move |e| {
+                        error!(
+                            "Failed response to {}, dropping connection. Reason: {:?}",
+                            addr, e
+                        );
+                        Ok(())
+                    })
             })
         })
         .buffer_unordered(1000)
@@ -485,4 +366,6 @@ fn main() {
     // Execute server.
     threadpool.spawn(srv);
     threadpool.shutdown_on_idle().wait().unwrap();
+
+    Ok(())
 }
