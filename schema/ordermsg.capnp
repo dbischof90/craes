@@ -16,6 +16,13 @@ struct OrderMsg {
     assetname @6 :UInt16;
 }
 
+
+struct VolumeTradedAtPrice {
+    volume @0 :Int32;
+    price @1 :Int32;
+}
+
+
 struct ResponseMsg {
-    success @0 :Bool;
+    executedtrades @0 :List(VolumeTradedAtPrice);
 }
