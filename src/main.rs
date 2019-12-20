@@ -28,12 +28,15 @@ use tracing_subscriber::fmt;
 
 mod database;
 mod errors;
-mod order;
-mod orderbook;
+//mod order;
+//mod orderbook;
+mod order_new;
+mod orderbook_new;
 mod protocol_capnp {
     include!(concat!(env!("OUT_DIR"), "/protocol_capnp.rs"));
 }
 
+/// Main routine. Launches and operates exchange.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::TRACE)
@@ -46,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .unwrap();
 
-    let database::Setup {
+    let database::ExchangeSetup {
         asset_ids,
         auth_pairs,
         max_order_id_at_boot,
@@ -56,25 +59,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("CRAES started, listening on: {}", server_addr);
     let mut threadpool = tokio::runtime::Runtime::new().unwrap();
     let mut addr_maps = HashMap::new();
-    let order_id = Arc::new(atomic::AtomicI32::new(max_order_id_at_boot + 1));
+    let order_id = Arc::new(atomic::AtomicU32::new(max_order_id_at_boot + 1));
 
-    // Database setup
+    // Database setup. Maps recorded orders and trades to a writable format and
+    // copies the message streams into database.
     let (dbchannel_tx, dbchannel_rx) = sync::mpsc::unbounded();
     let (order_db_tx, order_db_rx) = sync::mpsc::unbounded();
 
     let order_processing = order_db_rx
-        .map(|received_order: order::Order| {
-            let mut buf = [
-                received_order.id.to_string(),
-                received_order.buy.to_string(),
-                received_order.volume.to_string(),
-                match received_order.limit_price {
-                    Some(price) => price.to_string(),
-                    None => "".to_string(),
-                },
-                received_order.created_at.to_rfc3339(),
-            ]
-            .join("\t");
+        .map(|received_order: order_new::Order| {
+            let mut buf = match received_order {
+                order_new::Order::LimitMarket(order) => {
+                    let (limit_price_string, type_string) = match order.limit_price {
+                        Some(price) => (price.to_string(), "limit".to_string()),
+                        None => ("".to_string(), "market".to_string()),
+                    };
+                    [
+                        order.id.to_string(),
+                        order.buy.to_string(),
+                        order.volume.to_string(),
+                        limit_price_string,
+                        type_string,
+                        "".to_string(),
+                        order.created_at.to_rfc3339(),
+                    ]
+                    .join("\t")
+                }
+                order_new::Order::StopLimit(order) => {
+                    let (limit_price_string, type_string) = match order.limit_price {
+                        Some(price) => (price.to_string(), "stoplimit".to_string()),
+                        None => ("".to_string(), "stopmarket".to_string()),
+                    };
+                    [
+                        order.id.to_string(),
+                        order.buy.to_string(),
+                        order.volume.to_string(),
+                        limit_price_string,
+                        type_string,
+                        order.stop_limit.to_string(),
+                        order.created_at.to_rfc3339(),
+                    ]
+                    .join("\t")
+                }
+            };
             buf.push('\n');
             buf.into_bytes()
         })
@@ -83,16 +110,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trade_processing = dbchannel_rx
         .map(
             |executed_trades: std::collections::HashMap<
-                order::Order,
-                std::vec::Vec<order::Order>,
+                order_new::Order,
+                std::vec::Vec<order_new::UnconditionalOrder>,
             >| {
                 let rows_iter =
                     executed_trades
                         .into_iter()
                         .flat_map(|(executed_order, matched_orders)| {
+                            let executed_order_id = match executed_order {
+                                order_new::Order::LimitMarket(order) => order.id,
+                                order_new::Order::StopLimit(order) => order.id,
+                            };
                             matched_orders.into_iter().map(move |next_matched_order| {
                                 let mut buf = [
-                                    executed_order.id.to_string(),
+                                    executed_order_id.to_string(),
                                     next_matched_order.id.to_string(),
                                     next_matched_order.volume.to_string(),
                                     next_matched_order.limit_price.unwrap().to_string(),
@@ -113,22 +144,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     database::copy_into_database("trades".to_string(), trade_processing, &mut threadpool);
     database::copy_into_database("orders".to_string(), order_processing, &mut threadpool);
 
+    // Asset handling streams. Receive converted orders from the main stream, execute trades and
+    // organize database records plus responses to the clients.
     for i in asset_ids.into_iter() {
         let dbchannel_tx_local = dbchannel_tx.clone();
         let order_db_tx_local = order_db_tx.clone();
         let (assetchannel_tx, assetchannel_rx) = sync::mpsc::channel::<(
-            order::Order,
+            order_new::Order,
             sync::oneshot::Sender<
-                std::result::Result<std::vec::Vec<order::Order>, errors::AssetHandlingError>,
+                std::result::Result<
+                    std::vec::Vec<order_new::UnconditionalOrder>,
+                    errors::AssetHandlingError,
+                >,
             >,
         )>(0);
         addr_maps.insert(i, assetchannel_tx);
-        let ob = Arc::new(Mutex::new(orderbook::Orderbook::new(i.to_string())));
+        let order_book = Arc::new(Mutex::new(orderbook_new::Orderbook::new(i.to_string())));
 
         let handle_asset = assetchannel_rx
             .map_err(errors::AssetHandlingError::PhantomError)
             .and_then(move |(order_to_process, os_tx)| {
-                let local_orderbook = ob.clone();
+                let local_orderbook = order_book.clone();
                 debug!("Receiving order: {:?}", order_to_process);
                 future::poll_fn(move || {
                     blocking(|| {
@@ -189,6 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connections = Arc::new(RwLock::new(addr_maps));
     let shared_auth_pairs = Arc::new(RwLock::new(auth_pairs));
 
+    // Main routing server procedure. Organizes client handling, reads messages and converts them into
+    // internal order representations which are handled by the asset handlers. After trades are
+    // registered, converts and sends information back to clients.
     let srv = socket
         .incoming()
         .map_err(|e| {
@@ -257,40 +296,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         let asset_id = order_reader.get_assetname();
-
-                        let ordercondition = match order_reader.get_condition().which() {
-                            Ok(protocol_capnp::order_msg::condition::Which::Unconditional(())) => {
-                                order::OrderCondition::Unconditional
-                            }
+                        let stop_price = match order_reader.get_condition().which() {
                             Ok(protocol_capnp::order_msg::condition::Which::Stoporder(val)) => {
-                                order::OrderCondition::Stop {
-                                    stop: val.get_stop(),
-                                }
+                                Ok(Some(val.get_stop()))
                             }
-                            _ => order::OrderCondition::Unconditional,
+                            Err(e) => Err(errors::ServerError::DeserializationError(
+                                capnp::Error::from(e),
+                            )),
+                            _ => Ok(None),
                         };
-
-                        let limitprice = match order_reader.get_limitprice().which() {
-                            Ok(protocol_capnp::order_msg::limitprice::Which::None(())) => None,
+                        let limit_price = match order_reader.get_limitprice().which() {
                             Ok(protocol_capnp::order_msg::limitprice::Which::Some(val)) => {
-                                Some(val)
+                                Ok(Some(val))
                             }
-                            _ => None,
+                            Err(e) => Err(errors::ServerError::DeserializationError(
+                                capnp::Error::from(e),
+                            )),
+                            _ => Ok(None),
                         };
 
-                        let order_to_process = order::Order::new(
-                            order_id_local.fetch_add(1, atomic::Ordering::SeqCst),
-                            order_reader.get_buy(),
-                            order_reader.get_volume(),
-                            limitprice,
-                            ordercondition,
-                        );
-                        Ok((order_to_process, asset_id))
+                        match (limit_price, stop_price) {
+                            (Ok(l_price_opt), Ok(s_price_opt)) => {
+                                let new_order_id =
+                                    order_id_local.fetch_add(1, atomic::Ordering::SeqCst);
+                                let buy_sell = order_reader.get_buy();
+                                let volume = order_reader.get_volume();
+
+                                let order_to_process = if let Some(s_price) = s_price_opt {
+                                    order_new::Order::StopLimit(order_new::ConditionalOrder::new(
+                                        new_order_id,
+                                        buy_sell,
+                                        volume,
+                                        l_price_opt,
+                                        s_price,
+                                    ))
+                                } else {
+                                    order_new::Order::LimitMarket(
+                                        order_new::UnconditionalOrder::new(
+                                            new_order_id,
+                                            buy_sell,
+                                            volume,
+                                            l_price_opt,
+                                        ),
+                                    )
+                                };
+
+                                Ok((order_to_process, asset_id))
+                            }
+                            // For simplicity we only expose one price error. Since both
+                            // variants are potentially wrong, either option would be fine.
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
                     })
                     .and_then(move |(order_to_process, asset_id)| {
                         let (tx_os, rx_os) = futures::sync::oneshot::channel::<
                             std::result::Result<
-                                std::vec::Vec<order::Order>,
+                                std::vec::Vec<order_new::UnconditionalOrder>,
                                 errors::AssetHandlingError,
                             >,
                         >();
@@ -320,7 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for (i, order) in trades.iter().enumerate() {
                             let mut volume_traded = executed_trades_writer.reborrow().get(i as u32);
                             volume_traded.set_volume(order.volume);
-                            volume_traded.set_price(order.limit_price.unwrap());
+                            volume_traded.set_price(order.limit_price.unwrap().into_inner());
                         }
 
                         capnp_futures::serialize::write_message(

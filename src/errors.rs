@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use tokio_threadpool::BlockingError;
 use tungstenite::error::Error;
 
-use crate::order;
+use crate::order_new;
 
 type OrderReaderError = sync::mpsc::SendError<(
-    order::Order,
-    sync::oneshot::Sender<std::result::Result<std::vec::Vec<order::Order>, AssetHandlingError>>,
+    order_new::Order,
+    sync::oneshot::Sender<std::result::Result<std::vec::Vec<order_new::UnconditionalOrder>, AssetHandlingError>>,
 )>;
 #[derive(Debug)]
 pub enum ServerError {
@@ -29,8 +29,8 @@ pub enum AssetHandlingError {
 
 #[derive(Debug)]
 pub enum DatabaseChannelError {
-    Trades(sync::mpsc::SendError<HashMap<order::Order, Vec<order::Order>>>),
-    Orders(sync::mpsc::SendError<order::Order>),
+    Trades(sync::mpsc::SendError<HashMap<order_new::Order, Vec<order_new::UnconditionalOrder>>>),
+    Orders(sync::mpsc::SendError<order_new::Order>),
 }
 
 #[derive(Debug)]

@@ -12,10 +12,10 @@ use futures::{
 };
 
 #[derive(Debug)]
-pub struct Setup {
+pub struct ExchangeSetup {
     pub asset_ids: std::vec::Vec<u16>,
     pub auth_pairs: std::collections::HashMap<String, String>,
-    pub max_order_id_at_boot: i32,
+    pub max_order_id_at_boot: u32,
 }
 
 pub fn copy_into_database<S>(
@@ -63,7 +63,7 @@ pub fn copy_into_database<S>(
     threadpool.spawn(fut.map_err(drop));
 }
 
-pub fn setup_from_database() -> Setup {
+pub fn setup_from_database() -> ExchangeSetup {
     let mut temporary_runtime = tokio::runtime::Runtime::new().unwrap();
     let executor_handle = temporary_runtime.executor();
     let fut = tokio_postgres::connect(
@@ -105,15 +105,17 @@ pub fn setup_from_database() -> Setup {
             let max_order_id_res = client
                 .query(&max_order_id_stmt, &[])
                 .collect()
-                .map(|rows| rows[0].get::<_, i32>(0))
+                .map(|rows| rows[0].get::<_, u32>(0))
                 .map_err(errors::DatabaseError::ClientError);
 
             (asset_id_res, auth_pairs_res, max_order_id_res)
         },
     );
-    let (asset_id, auth_pairs, max_order_id) = temporary_runtime.block_on(fut).unwrap();
+    let (asset_id, auth_pairs, max_order_id) = temporary_runtime
+        .block_on(fut)
+        .expect("Problem during setup download from database.");
 
-    Setup {
+    ExchangeSetup {
         asset_ids: asset_id.collect(),
         auth_pairs: std::collections::HashMap::from_iter(auth_pairs),
         max_order_id_at_boot: max_order_id,
