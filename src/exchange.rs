@@ -274,7 +274,6 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                 let passphrase = headers.find_first("Password");
                 let mut base_error = ErrorResponse::from(http::status::StatusCode::BAD_REQUEST);
                 let auth_resp = String::from("Response");
-
                 if username.and(passphrase).is_some() {
                     let auth_pairs_unlocked = shared_auth_pairs_local
                         .read()
@@ -292,10 +291,10 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                     }
                 }
                 base_error.headers = Some(vec![(auth_resp, String::from("Wrong credentials"))]);
-                error!("Failed connection attempt from {}", req.path);
+                error!("Failed connection attempt from {}", &addr);
                 Err(base_error)
             })
-            .map_err(|e| error!("Handshake failed: {:?}", e))
+            .map_err(errors::ServerError::WebSocketError)
             .and_then(move |ws_stream| {
                 info!("Client registering at {}", &addr);
                 let (response_to_client, order_stream) = ws_stream.split();
@@ -462,12 +461,16 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         Ok(())
                     })
             })
+            .or_else(|e| {
+                error!("Handshake failed: {:?}", e);
+                Ok(())
+            })
         })
         .buffer_unordered(1000)
         .for_each(|_| Ok(()));
 
     // Execute server.
-    threadpool.spawn(srv);
+    threadpool.spawn(srv.map_err(drop));
     threadpool.shutdown_on_idle().wait().unwrap();
 
     Ok(())
