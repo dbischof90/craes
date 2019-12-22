@@ -17,6 +17,7 @@ pub enum ServerError {
     DeserializationError(capnp::Error),
     AssetHandlingError(AssetHandlingError),
     ResponseError(sync::mpsc::SendError<tungstenite::protocol::Message>),
+    AssetDoesNotExist
 }
 
 #[derive(Debug)]

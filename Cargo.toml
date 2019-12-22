@@ -1,6 +1,6 @@
 [package]
 name = "craes"
-version = "0.0.5"
+version = "0.0.9"
 authors = ["Daniel Bischof <daniel.bischof@protonmail.com>"]
 edition = "2018"
 build = "build.rs"
@@ -23,6 +23,8 @@ tracing = "0.1"
 tracing-futures = "0.1"
 tracing-subscriber = "0.1"
 ordered-float = "*"
+dtoa = "*"
+structopt = "*"
 
 [build-dependencies]
 capnpc = "0.10"

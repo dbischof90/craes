@@ -9,11 +9,10 @@ struct OrderMsg {
     }
     condition :union {
         unconditional @4 :Void;
-        stoporder :group {
-            stop @5 :Float32;
-        }
+        stoploss @5 :Float32;
+        stopandreverse @6 :Float32;
     }
-    assetname @6 :UInt16;
+    assetname @7 :UInt16;
 }
 
 

@@ -11,6 +11,23 @@ pub enum Order {
     StopLimit(ConditionalOrder),
 }
 
+/// A complementary structure. Used to reconstruct a conditional order after converting it to an
+/// unconditional order.
+#[derive(Debug)]
+pub struct OrderComplement {
+    pub stop_limit: ordered_float::OrderedFloat<f32>,
+    pub condition: ConditionalType
+}
+
+
+/// A type compositor for conditional orders. Specializes order type and allows specific treatment
+/// in resolution.
+#[derive(Eq, PartialEq, Debug, Copy, Clone)]
+pub enum ConditionalType {
+    StopLoss,
+    StopAndReverse
+}
+
 /// Unconditional orders. These orders can be either limit orders
 /// or market orders, depending whether they have a limit price or not.
 #[derive(Eq, Debug, Copy, Clone)]
@@ -33,6 +50,7 @@ pub struct ConditionalOrder {
     pub volume: u32,
     pub limit_price: Option<ordered_float::OrderedFloat<f32>>,
     pub stop_limit: ordered_float::OrderedFloat<f32>,
+    pub condition: ConditionalType,
     pub created_at: DateTime<Local>,
     pub filled_at: Option<DateTime<Local>>,
 }
@@ -43,29 +61,31 @@ impl ConditionalOrder {
         buy: bool,
         volume: u32,
         limit_price: Option<f32>,
+        condition: ConditionalType,
         stop_limit: f32,
     ) -> ConditionalOrder {
         ConditionalOrder {
             id,
             buy,
             limit_price: limit_price.map(ordered_float::OrderedFloat::from),
+            condition,
             stop_limit: ordered_float::OrderedFloat(stop_limit),
             volume,
             created_at: Local::now(),
             filled_at: None,
         }
     }
-   
+
     /// Becomes 1 and -1 for a buy and sell order.
     #[inline]
     pub fn trade_direction(&self) -> f32 {
-        (2 * (self.buy as i8) - 1) as f32
+        (2 * (self.buy as u8) - 1) as f32
     }
 }
 
 impl PartialEq for ConditionalOrder {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        (self.id, self.volume) == (other.id, other.volume)
     }
 }
 
@@ -101,7 +121,8 @@ impl Ord for ConditionalOrder {
             .cmp(&(
                 ordered_float::OrderedFloat(other.stop_limit.into_inner() * ls_other),
                 other.volume,
-                other.limit_price
+                other
+                    .limit_price
                     .map(|p| ordered_float::OrderedFloat(p.into_inner() * ls_self)),
             ))
     }
@@ -113,26 +134,42 @@ impl Hash for ConditionalOrder {
     }
 }
 
-impl From<ConditionalOrder> for UnconditionalOrder {
+impl From<ConditionalOrder> for (UnconditionalOrder, OrderComplement) {
     fn from(stop_order: ConditionalOrder) -> Self {
-        UnconditionalOrder {
-            limit_price: stop_order.limit_price,
-            buy: !stop_order.buy,
-            id: stop_order.id,
-            volume: stop_order.volume,
-            created_at: stop_order.created_at,
+        (
+            UnconditionalOrder {
+                limit_price: stop_order.limit_price,
+                buy: stop_order.buy,
+                id: stop_order.id,
+                volume: stop_order.volume,
+                created_at: stop_order.created_at,
+                filled_at: None,
+            },
+            OrderComplement {
+                stop_limit: stop_order.stop_limit,
+                condition: stop_order.condition
+            },
+        )
+    }
+}
+
+impl From<(UnconditionalOrder, OrderComplement)> for ConditionalOrder {
+    fn from(order_tuple: (UnconditionalOrder, OrderComplement)) -> Self {
+        ConditionalOrder {
+            limit_price: order_tuple.0.limit_price,
+            buy: !order_tuple.0.buy,
+            id: order_tuple.0.id,
+            volume: order_tuple.0.volume,
+            created_at: order_tuple.0.created_at,
             filled_at: None,
+            stop_limit: order_tuple.1.stop_limit,
+            condition: order_tuple.1.condition
         }
     }
 }
 
 impl UnconditionalOrder {
-    pub fn new(
-        id: u32,
-        buy: bool,
-        volume: u32,
-        limit_price: Option<f32>,
-    ) -> UnconditionalOrder {
+    pub fn new(id: u32, buy: bool, volume: u32, limit_price: Option<f32>) -> UnconditionalOrder {
         UnconditionalOrder {
             id,
             buy,
@@ -142,7 +179,7 @@ impl UnconditionalOrder {
             filled_at: None,
         }
     }
-    
+
     /// Marks the order as filled.
     #[inline]
     pub fn fill(&mut self) {
@@ -162,21 +199,13 @@ impl UnconditionalOrder {
     /// Becomes 1 and -1 for a buy and sell order.
     #[inline]
     pub fn trade_direction(&self) -> f32 {
-        (2 * (self.buy as i32) - 1) as f32
+        (2 * (self.buy as i8) - 1) as f32
     }
-
-    /// Expresses price priority as a float. Market orders have unconditional priority and are
-    /// treated as the largest float.
-    #[inline]
-    pub fn limit_price_priority(&self) -> f32 {
-        self.limit_price.unwrap_or(ordered_float::OrderedFloat(std::f32::MIN)).into_inner()
-    }
-
 }
 
 impl PartialEq for UnconditionalOrder {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        (self.id, self.volume) == (other.id, other.volume)
     }
 }
 

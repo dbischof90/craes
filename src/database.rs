@@ -1,6 +1,6 @@
 use std::iter::FromIterator;
 
-use crate::errors;
+use crate::{errors, Config};
 
 use tracing;
 use tracing::{debug, error, span, Level};
@@ -22,13 +22,22 @@ pub fn copy_into_database<S>(
     table_name: String,
     lines_stream: S,
     threadpool: &mut tokio::runtime::Runtime,
+    config: &Config,
 ) where
     S: Stream<Item = std::vec::Vec<u8>, Error = errors::DatabaseError> + Send + 'static,
 {
     let executor_handle = threadpool.executor();
     let table_name_cl = table_name.clone();
+    let db_config = format!(
+        "host={db_host} user={db_user} dbname={db_name} port={db_port}",
+        db_host = config.database_addr,
+        db_user = config.database_user,
+        db_name = config.database_name,
+        db_port = config.database_port
+    );
+
     let fut = tokio_postgres::connect(
-        "host=router user=postgres dbname=craes",
+        &db_config,
         tokio_postgres::NoTls,
     )
     .map(move |(client, connection)| {
@@ -43,13 +52,17 @@ pub fn copy_into_database<S>(
     .map_err(errors::DatabaseError::ClientError)
     .and_then(|(mut client, statement)| {
         lines_stream
-            .chunks(1)
+            .chunks(2)
             .and_then(move |prepared_rows| {
                 debug!("Writing {} lines", &prepared_rows.len());
                 let stream_rows = iter_ok::<_, std::io::Error>(prepared_rows);
                 client
                     .copy_in(&statement, &[], stream_rows)
                     .map_err(errors::DatabaseError::ClientError)
+            })
+            .or_else(|e| {
+                error!("Error while copying to database: {:?}", e);
+                Ok(0u64)
             })
             .for_each(|_| Ok(()))
     })
@@ -63,11 +76,20 @@ pub fn copy_into_database<S>(
     threadpool.spawn(fut.map_err(drop));
 }
 
-pub fn setup_from_database() -> ExchangeSetup {
+pub fn setup_from_database(config: &Config) -> ExchangeSetup {
     let mut temporary_runtime = tokio::runtime::Runtime::new().unwrap();
     let executor_handle = temporary_runtime.executor();
+
+    let db_config = format!(
+        "host={db_host} user={db_user} dbname={db_name} port={db_port}",
+        db_host = config.database_addr,
+        db_user = config.database_user,
+        db_name = config.database_name,
+        db_port = config.database_port
+    );
+
     let fut = tokio_postgres::connect(
-        "host=router user=postgres dbname=craes",
+        &db_config,
         tokio_postgres::NoTls,
     )
     .map(move |(client, connection)| {
@@ -75,9 +97,9 @@ pub fn setup_from_database() -> ExchangeSetup {
         client
     })
     .and_then(move |mut client| {
-        let asset_id_prep = client.prepare("SELECT name FROM asset_info");
+        let asset_id_prep = client.prepare("SELECT id FROM asset_info");
         let auth_pairs_prep = client.prepare("SELECT username, passphrase FROM user_info");
-        let max_order_id_prep = client.prepare("SELECT MAX(id) FROM orders");
+        let max_order_id_prep = client.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM orders");
         asset_id_prep.join3(auth_pairs_prep, max_order_id_prep).map(
             |(asset_id_prep, auth_pairs_prep, max_order_id_prep)| {
                 (client, asset_id_prep, auth_pairs_prep, max_order_id_prep)
@@ -105,7 +127,7 @@ pub fn setup_from_database() -> ExchangeSetup {
             let max_order_id_res = client
                 .query(&max_order_id_stmt, &[])
                 .collect()
-                .map(|rows| rows[0].get::<_, u32>(0))
+                .map(|rows| rows[0].get::<_, i32>(0) as u32)
                 .map_err(errors::DatabaseError::ClientError);
 
             (asset_id_res, auth_pairs_res, max_order_id_res)
