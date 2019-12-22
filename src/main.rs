@@ -3,10 +3,8 @@
 mod unit_tests;
 mod database;
 mod errors;
-//mod order;
-//mod orderbook;
-mod order_new;
-mod orderbook_new;
+mod order;
+mod orderbook;
 mod exchange;
 mod protocol_capnp {
     include!(concat!(env!("OUT_DIR"), "/protocol_capnp.rs"));

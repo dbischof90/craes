@@ -1,4 +1,4 @@
-use crate::{database, errors, order_new, orderbook_new, protocol_capnp, Config};
+use crate::{database, errors, order, orderbook, protocol_capnp, Config};
 
 use std::collections::HashMap;
 use std::sync::{atomic, Arc, Mutex, RwLock};
@@ -57,9 +57,9 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
     let (order_db_tx, order_db_rx) = sync::mpsc::unbounded();
 
     let order_processing = order_db_rx
-        .map(|received_order: order_new::Order| {
+        .map(|received_order: order::Order| {
             let mut buf = match received_order {
-                order_new::Order::LimitMarket(order) => {
+                order::Order::LimitMarket(order) => {
                     let (limit_price_string, type_string) = match order.limit_price {
                         // TODO: Although not expected, errors should be handled here. Find test case
                         // which could trigger failure!
@@ -83,7 +83,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                     ]
                     .join("\t")
                 }
-                order_new::Order::StopLimit(order) => {
+                order::Order::StopLimit(order) => {
                     let (limit_price_string, type_string) = match order.limit_price {
                         Some(price) => {
                             let mut float_buf = Vec::new();
@@ -117,16 +117,16 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
     let trade_processing = dbchannel_rx
         .map(
             |executed_trades: std::collections::HashMap<
-                order_new::Order,
-                std::vec::Vec<order_new::UnconditionalOrder>,
+                order::Order,
+                std::vec::Vec<order::UnconditionalOrder>,
             >| {
                 let rows_iter =
                     executed_trades
                         .into_iter()
                         .flat_map(|(executed_order, matched_orders)| {
                             let executed_order_id = match executed_order {
-                                order_new::Order::LimitMarket(order) => order.id,
-                                order_new::Order::StopLimit(order) => order.id,
+                                order::Order::LimitMarket(order) => order.id,
+                                order::Order::StopLimit(order) => order.id,
                             };
                             matched_orders.into_iter().map(move |next_matched_order| {
                                 let mut float_buf = Vec::new();
@@ -176,16 +176,16 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
         let dbchannel_tx_local = dbchannel_tx.clone();
         let order_db_tx_local = order_db_tx.clone();
         let (assetchannel_tx, assetchannel_rx) = sync::mpsc::channel::<(
-            order_new::Order,
+            order::Order,
             sync::oneshot::Sender<
                 std::result::Result<
-                    std::vec::Vec<order_new::UnconditionalOrder>,
+                    std::vec::Vec<order::UnconditionalOrder>,
                     errors::AssetHandlingError,
                 >,
             >,
         )>(0);
         addr_maps.insert(i, assetchannel_tx);
-        let order_book = Arc::new(Mutex::new(orderbook_new::Orderbook::new(i.to_string())));
+        let order_book = Arc::new(Mutex::new(orderbook::Orderbook::new(i.to_string())));
 
         let handle_asset = assetchannel_rx
             .map_err(errors::AssetHandlingError::PhantomError)
@@ -330,11 +330,11 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         let asset_id = order_reader.get_assetname();
                         let cond_info = match order_reader.get_condition().which() {
                             Ok(protocol_capnp::order_msg::condition::Which::Stoploss(val)) => {
-                                Ok(Some((val, order_new::ConditionalType::StopLoss)))
+                                Ok(Some((val, order::ConditionalType::StopLoss)))
                             }
                             Ok(protocol_capnp::order_msg::condition::Which::Stopandreverse(
                                 val,
-                            )) => Ok(Some((val, order_new::ConditionalType::StopAndReverse))),
+                            )) => Ok(Some((val, order::ConditionalType::StopAndReverse))),
                             Err(e) => Err(errors::ServerError::DeserializationError(
                                 capnp::Error::from(e),
                             )),
@@ -360,7 +360,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                                 let order_to_process = if let Some((trigger_price, condition)) =
                                     c_info_opt
                                 {
-                                    order_new::Order::StopLimit(order_new::ConditionalOrder::new(
+                                    order::Order::StopLimit(order::ConditionalOrder::new(
                                         new_order_id,
                                         buy_sell,
                                         volume,
@@ -369,8 +369,8 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                                         trigger_price,
                                     ))
                                 } else {
-                                    order_new::Order::LimitMarket(
-                                        order_new::UnconditionalOrder::new(
+                                    order::Order::LimitMarket(
+                                        order::UnconditionalOrder::new(
                                             new_order_id,
                                             buy_sell,
                                             volume,
@@ -389,7 +389,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                     .and_then(move |(order_to_process, asset_id)| {
                         let (tx_os, rx_os) = futures::sync::oneshot::channel::<
                             std::result::Result<
-                                std::vec::Vec<order_new::UnconditionalOrder>,
+                                std::vec::Vec<order::UnconditionalOrder>,
                                 errors::AssetHandlingError,
                             >,
                         >();

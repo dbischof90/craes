@@ -1,190 +1,180 @@
-use crate::order::{Order, OrderCondition};
-use boolinator::Boolinator;
+#![allow(dead_code)]
+
+use crate::order::{ConditionalOrder, Order, OrderComplement, UnconditionalOrder};
 use stacker;
 use std::cmp::Ordering;
-use std::collections::binary_heap::PeekMut;
-use std::collections::hash_map::Entry;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::mem;
 
+/// A limit order book. Contains both limit and stop order books.
 #[derive(Debug)]
 pub struct Orderbook {
-    buy_orders: BinaryHeap<Order>,
-    sell_orders: BinaryHeap<Order>,
-    symbol: String,
+    limit_buy_orders: BinaryHeap<UnconditionalOrder>,
+    limit_sell_orders: BinaryHeap<UnconditionalOrder>,
+    stop_buy_orders: BinaryHeap<ConditionalOrder>,
+    stop_sell_orders: BinaryHeap<ConditionalOrder>,
+    pub symbol: String,
 }
 
 impl Orderbook {
+    /// Constructs a new book.
     pub fn new(symbol: String) -> Orderbook {
         Orderbook {
-            buy_orders: BinaryHeap::new(),
-            sell_orders: BinaryHeap::new(),
+            limit_buy_orders: BinaryHeap::new(),
+            limit_sell_orders: BinaryHeap::new(),
+            stop_buy_orders: BinaryHeap::new(),
+            stop_sell_orders: BinaryHeap::new(),
             symbol,
         }
     }
 
-    pub fn len(&self) -> (usize, usize) {
-        (self.buy_orders.len(), self.sell_orders.len())
-    }
+    /// Main method to resolve an incoming order.
+    pub fn resolve_order(
+        &mut self,
+        order_to_resolve: Order,
+    ) -> HashMap<Order, Vec<UnconditionalOrder>> {
+        let mut trades: HashMap<Order, Vec<UnconditionalOrder>> = HashMap::new();
 
-    pub fn resolve_order(&mut self, order_to_resolve: Order) -> HashMap<Order, Vec<Order>> {
-        let buy_orders = mem::replace(&mut self.buy_orders, BinaryHeap::new());
-        let sell_orders = mem::replace(&mut self.sell_orders, BinaryHeap::new());
-        if order_to_resolve.buy {
-            let (sell_orders, buy_orders, trade_set) =
-                Self::trade_orders(sell_orders, buy_orders, order_to_resolve);
-            self.sell_orders = sell_orders;
-            self.buy_orders = buy_orders;
-            trade_set
-        } else {
-            let (buy_orders, sell_orders, trade_set) =
-                Self::trade_orders(buy_orders, sell_orders, order_to_resolve);
-            self.sell_orders = sell_orders;
-            self.buy_orders = buy_orders;
-            trade_set
-        }
-    }
+        // In case the incoming order is a limit order, a more general resolution function
+        // is called. Stop orders are purely passive and need to be triggered, hence they
+        // are placed into the books immediately.
+        match order_to_resolve {
+            Order::LimitMarket(order) => {
+                if order.buy {
+                    trade_orders(
+                        order,
+                        None,
+                        &mut trades,
+                        &mut self.limit_buy_orders,
+                        &mut self.limit_sell_orders,
+                        &mut self.stop_buy_orders,
+                        &mut self.stop_sell_orders,
+                    )
+                } else {
+                    trade_orders(
+                        order,
+                        None,
+                        &mut trades,
+                        &mut self.limit_sell_orders,
+                        &mut self.limit_buy_orders,
+                        &mut self.stop_sell_orders,
+                        &mut self.stop_buy_orders,
+                    )
+                }
+            }
 
-    pub fn cancel_order(&mut self, order_to_cancel: Order) -> Result<(), &'static str> {
-        let order_heap = if order_to_cancel.buy {
-            &mut self.buy_orders
-        } else {
-            &mut self.sell_orders
-        };
-
-        let tested_trades = &mut BinaryHeap::with_capacity(order_heap.len());
-        while let Some(head_order) = order_heap.pop() {
-            if head_order == order_to_cancel {
-                order_heap.append(tested_trades);
-                return Ok(());
-            } else {
-                tested_trades.push(head_order);
+            Order::StopLimit(order) => {
+                if order.buy {
+                    self.stop_buy_orders.push(order)
+                } else {
+                    self.stop_sell_orders.push(order)
+                }
             }
         }
-        Err("Order was not in orderbook.")
+        trades
     }
+}
 
-    fn trade_orders(
-        mut book_to_resolve: BinaryHeap<Order>,
-        mut order_heap: BinaryHeap<Order>,
-        mut trade_to_resolve: Order,
-    ) -> (
-        BinaryHeap<Order>,
-        BinaryHeap<Order>,
-        HashMap<Order, Vec<Order>>,
-    ) {
-        let mut matched_orders: Vec<Order> = Vec::new();
-        let (subsequent_trade, subsequential_conditional, resolvable) = {
-            let mut book_head = book_to_resolve.peek_mut();
-            let (quantitative_relation, order_activable, book_not_empty) = match book_head {
-                None => (None, false, false),
-                Some(ref mut head_order) => match head_order.condition {
-                    OrderCondition::Unconditional => (
-                        trade_to_resolve
-                            .is_active_with(&(*head_order))
-                            .as_some(trade_to_resolve.volume.cmp(&(*head_order).volume)),
-                        trade_to_resolve.is_active_with(&(*head_order)),
-                        true,
-                    ),
-                    OrderCondition::Stop { .. } => {
-                        head_order.condition = OrderCondition::Unconditional;
-                        head_order.buy != head_order.buy;
-                        (None, trade_to_resolve.is_active_with(&(*head_order)), true)
-                    }
-                },
-            };
+/// Recursive trade execution. Mutates the existing order books
+/// and triggers conditional trades during trade resolution.
+fn trade_orders(
+    order_to_resolve: UnconditionalOrder,
+    order_complement: Option<OrderComplement>,
+    trades: &mut HashMap<Order, Vec<UnconditionalOrder>>,
+    active_limit_book: &mut BinaryHeap<UnconditionalOrder>,
+    backlog_limit_book: &mut BinaryHeap<UnconditionalOrder>,
+    active_stop_book: &mut BinaryHeap<ConditionalOrder>,
+    backlog_stop_book: &mut BinaryHeap<ConditionalOrder>,
+) {
+    // Initial calculation and allocation
+    let mut order_volume = order_to_resolve.volume;
+    let ls = order_to_resolve.trade_direction();
+    let limit_price_priority_f32 = order_to_resolve
+        .limit_price
+        .map(|p| p.into_inner() * ls)
+        .unwrap_or(std::f32::MAX);
+    let mut resolved_orders = Vec::new();
+    loop {
+        // Check whether a stop order is triggered by the execution.
+        // Also triggers all recursive stop-order dependencies which are
+        // resolved after this block and we can assume to have a standard
+        // limit order resolution as the last step.
+        if let Some(existing_stop_order) = active_stop_book.peek() {
+            if limit_price_priority_f32 >= existing_stop_order.stop_limit.into_inner() * ls {
+                let stop_order_to_execute = active_stop_book.pop().unwrap();
+                let (converted_limit_order, stop_order_complement) = stop_order_to_execute.into();
 
-            let (subsequent_trade, subsequential_conditional) =
-                if let Some(comparison) = quantitative_relation {
-                    let mut head_order_peek = book_head.unwrap();
-                    let subsequent_trade = match comparison {
-                        Ordering::Equal => {
-                            let mut head_order = PeekMut::pop(head_order_peek);
-                            head_order.fill();
-                            matched_orders.push(head_order);
-                            None
-                        }
-                        Ordering::Less => {
-                            let mut head_order =
-                                head_order_peek.split_at_volume(trade_to_resolve.volume);
-                            head_order.fill();
-                            matched_orders.push(head_order);
-                            None
-                        }
-                        Ordering::Greater => {
-                            trade_to_resolve.volume -= head_order_peek.volume;
-                            let mut head_order = PeekMut::pop(head_order_peek);
-                            head_order.fill();
-                            matched_orders.push(head_order);
-                            Some(trade_to_resolve)
-                        }
-                    };
-                    (subsequent_trade, None)
-                } else {
-                    (
-                        Some(trade_to_resolve),
-                        book_head
-                            .filter(|_| order_activable)
-                            .map(|x| PeekMut::pop(x)),
+                // Extends the stack to the heap in case an overflow is apparent.
+                stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+                    trade_orders(
+                        converted_limit_order,
+                        Some(stop_order_complement),
+                        trades,
+                        backlog_limit_book,
+                        active_limit_book,
+                        backlog_stop_book,
+                        active_stop_book,
                     )
-                };
-            (
-                subsequent_trade,
-                subsequential_conditional,
-                order_activable & book_not_empty,
-            )
-        };
+                })
+            }
+        }
 
-        let mut resolved_trades = HashMap::<Order, Vec<Order>>::default();
-        if resolvable {
-            stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
-                let (order_heap, book_to_resolve, resolved_conditional_trades) =
-                    match subsequential_conditional {
-                        Some(order) => Self::trade_orders(order_heap, book_to_resolve, order),
-                        None => (
-                            book_to_resolve,
-                            order_heap,
-                            HashMap::<Order, Vec<Order>>::default(),
-                        ),
-                    };
-
-                let (book_to_resolve, order_heap, mut resolved_trades) = match subsequent_trade {
-                    Some(order) => Self::trade_orders(book_to_resolve, order_heap, order),
-                    None => (
-                        book_to_resolve,
-                        order_heap,
-                        HashMap::<Order, Vec<Order>>::default(),
-                    ),
-                };
-
-                match resolved_trades.entry(trade_to_resolve) {
-                    Entry::Occupied(entry) => {
-                        entry.into_mut().extend(matched_orders);
+        // The next check considers the actual limit order book.
+        // An order can execute a trade if it is eligible on the limit price level. If not,
+        // it will be placed onto the limit order book for later execution.
+        if let Some(next_limit_order) = active_limit_book.peek() {
+            if limit_price_priority_f32 >= next_limit_order.limit_price.unwrap().into_inner() * ls {
+                let cmp = order_volume.cmp(&next_limit_order.volume);
+                match cmp {
+                    Ordering::Equal => {
+                        // The order is written on the same volume and fills the remaining
+                        // order size perfectly.
+                        let mut executed_trade = active_limit_book.pop().unwrap();
+                        executed_trade.fill();
+                        resolved_orders.push(executed_trade);
+                        break;
                     }
-                    Entry::Vacant(entry) => {
-                        entry.insert(matched_orders);
+                    Ordering::Greater => {
+                        // The order exceeds the volume available on the best buy/sell order.
+                        // The front of the book is removed and the order is partially traded.
+                        let mut executed_trade = active_limit_book.pop().unwrap();
+                        executed_trade.fill();
+                        order_volume -= executed_trade.volume;
+                        resolved_orders.push(executed_trade);
                     }
-                };
-
-                resolved_trades.extend(resolved_conditional_trades);
-                (book_to_resolve, order_heap, resolved_trades)
-            })
-        } else {
-            match trade_to_resolve.condition {
-                OrderCondition::Unconditional => {
-                    match trade_to_resolve.limit_price {
-                        Some(_) => {
-                            order_heap.push(trade_to_resolve);
-                        }
-                        None => {
-                            resolved_trades.insert(trade_to_resolve, Vec::<Order>::new());
-                        }
-                    };
+                    Ordering::Less => {
+                        // The front of the orderbook exceeds the order to resolve in size
+                        // and is traded partially.
+                        let mut mutable_front_book = active_limit_book.peek_mut().unwrap();
+                        let mut executed_trade = mutable_front_book.split_at_volume(order_volume);
+                        executed_trade.fill();
+                        resolved_orders.push(executed_trade);
+                        break;
+                    }
                 }
-                OrderCondition::Stop { .. } => order_heap.push(trade_to_resolve),
-            };
-            (book_to_resolve, order_heap, resolved_trades)
+            } else {
+                backlog_limit_book.push(order_to_resolve);
+                break;
+            }
+        } else {
+            // If there is no limit order left to trade against, the order is put into the order
+            // book if it is not a market order.
+            if order_to_resolve.limit_price.is_some() {
+                backlog_limit_book.push(order_to_resolve);
+            }
+            break;
         }
     }
+
+    // After all operations on the order books are completed, the resulting
+    // trades are saved. In case the order was deconstructed from another order, the order is
+    // reconstructed first.
+    if let Some(complement) = order_complement {
+        trades.insert(
+            Order::StopLimit(ConditionalOrder::from((order_to_resolve, complement))),
+            resolved_orders,
+        )
+    } else {
+        trades.insert(Order::LimitMarket(order_to_resolve), resolved_orders)
+    };
 }
