@@ -15,7 +15,7 @@ pub enum Order {
 /// unconditional order.
 #[derive(Debug)]
 pub struct OrderComplement {
-    pub stop_limit: ordered_float::OrderedFloat<f32>,
+    pub trigger_price: ordered_float::OrderedFloat<f32>,
     pub condition: ConditionalType
 }
 
@@ -49,7 +49,7 @@ pub struct ConditionalOrder {
     pub buy: bool,
     pub volume: u32,
     pub limit_price: Option<ordered_float::OrderedFloat<f32>>,
-    pub stop_limit: ordered_float::OrderedFloat<f32>,
+    pub trigger_price: ordered_float::OrderedFloat<f32>,
     pub condition: ConditionalType,
     pub created_at: DateTime<Local>,
     pub filled_at: Option<DateTime<Local>>,
@@ -62,14 +62,14 @@ impl ConditionalOrder {
         volume: u32,
         limit_price: Option<f32>,
         condition: ConditionalType,
-        stop_limit: f32,
+        trigger_price: f32,
     ) -> ConditionalOrder {
         ConditionalOrder {
             id,
             buy,
             limit_price: limit_price.map(ordered_float::OrderedFloat::from),
             condition,
-            stop_limit: ordered_float::OrderedFloat(stop_limit),
+            trigger_price: ordered_float::OrderedFloat(trigger_price),
             volume,
             created_at: Local::now(),
             filled_at: None,
@@ -95,12 +95,12 @@ impl PartialOrd for ConditionalOrder {
         let ls_other = other.trade_direction();
 
         (
-            self.stop_limit.into_inner() * ls_self,
+            self.trigger_price.into_inner() * ls_self,
             self.volume,
             self.limit_price.map(|p| p.into_inner() * ls_other),
         )
             .partial_cmp(&(
-                other.stop_limit.into_inner() * ls_other,
+                other.trigger_price.into_inner() * ls_other,
                 other.volume,
                 other.limit_price.map(|p| p.into_inner() * ls_self),
             ))
@@ -113,13 +113,13 @@ impl Ord for ConditionalOrder {
         let ls_other = other.trade_direction();
 
         (
-            ordered_float::OrderedFloat(self.stop_limit.into_inner() * ls_self),
+            ordered_float::OrderedFloat(self.trigger_price.into_inner() * ls_self),
             self.volume,
             self.limit_price
                 .map(|p| ordered_float::OrderedFloat(p.into_inner() * ls_other)),
         )
             .cmp(&(
-                ordered_float::OrderedFloat(other.stop_limit.into_inner() * ls_other),
+                ordered_float::OrderedFloat(other.trigger_price.into_inner() * ls_other),
                 other.volume,
                 other
                     .limit_price
@@ -146,7 +146,7 @@ impl From<ConditionalOrder> for (UnconditionalOrder, OrderComplement) {
                 filled_at: None,
             },
             OrderComplement {
-                stop_limit: stop_order.stop_limit,
+                trigger_price: stop_order.trigger_price,
                 condition: stop_order.condition
             },
         )
@@ -157,12 +157,12 @@ impl From<(UnconditionalOrder, OrderComplement)> for ConditionalOrder {
     fn from(order_tuple: (UnconditionalOrder, OrderComplement)) -> Self {
         ConditionalOrder {
             limit_price: order_tuple.0.limit_price,
-            buy: !order_tuple.0.buy,
+            buy: order_tuple.0.buy,
             id: order_tuple.0.id,
             volume: order_tuple.0.volume,
             created_at: order_tuple.0.created_at,
             filled_at: None,
-            stop_limit: order_tuple.1.stop_limit,
+            trigger_price: order_tuple.1.trigger_price,
             condition: order_tuple.1.condition
         }
     }

@@ -2,7 +2,7 @@
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 
-CREATE TYPE order_type AS ENUM('limit', 'market', 'stoplimit', 'stopmarket');
+CREATE TYPE order_type AS ENUM('marketlimit', 'stoploss', 'sar');
 
 -- Set up tables
 

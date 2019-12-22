@@ -60,7 +60,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
         .map(|received_order: order::Order| {
             let mut buf = match received_order {
                 order::Order::LimitMarket(order) => {
-                    let (limit_price_string, type_string) = match order.limit_price {
+                    let limit_price_string = match order.limit_price {
                         // TODO: Although not expected, errors should be handled here. Find test case
                         // which could trigger failure!
                         Some(price) => {
@@ -68,42 +68,44 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                             dtoa::write(&mut float_buf, price.into_inner()).expect(
                                 "Unexpected floating value while deseralizing for database copy",
                             );
-                            (String::from_utf8(float_buf).unwrap(), "limit".to_string())
+                            String::from_utf8(float_buf).unwrap()
                         }
-                        None => ("\\N".to_string(), "market".to_string()),
+                        None => "\\N".to_string(),
                     };
                     [
                         order.id.to_string(),
                         order.buy.to_string(),
                         order.volume.to_string(),
                         limit_price_string,
-                        type_string,
+                        "marketlimit".to_string(),
                         "\\N".to_string(),
                         order.created_at.to_rfc3339(),
                     ]
                     .join("\t")
                 }
                 order::Order::StopLimit(order) => {
-                    let (limit_price_string, type_string) = match order.limit_price {
+                    let limit_price_string = match order.limit_price {
                         Some(price) => {
                             let mut float_buf = Vec::new();
                             dtoa::write(&mut float_buf, price.into_inner()).expect(
                                 "Unexpected floating value while deseralizing for database copy",
                             );
-                            (
-                                String::from_utf8(float_buf).unwrap(),
-                                "stoplimit".to_string(),
-                            )
+                            String::from_utf8(float_buf).unwrap()
                         }
-                        None => ("\\N".to_string(), "stopmarket".to_string()),
+                        None => "\\N".to_string(),
+                    };
+
+                    let type_string = match order.condition {
+                        order::ConditionalType::StopLoss => "stoploss",
+                        order::ConditionalType::StopAndReverse => "sar",
                     };
                     [
                         order.id.to_string(),
                         order.buy.to_string(),
                         order.volume.to_string(),
                         limit_price_string,
-                        type_string,
-                        order.stop_limit.to_string(),
+                        type_string.to_string(),
+                        order.trigger_price.to_string(),
                         order.created_at.to_rfc3339(),
                     ]
                     .join("\t")
@@ -117,45 +119,45 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
     let trade_processing = dbchannel_rx
         .map(
             |executed_trades: std::collections::HashMap<
-                order::Order,
-                std::vec::Vec<order::UnconditionalOrder>,
+            order::Order,
+            std::vec::Vec<order::UnconditionalOrder>,
             >| {
                 let rows_iter =
                     executed_trades
-                        .into_iter()
-                        .flat_map(|(executed_order, matched_orders)| {
-                            let executed_order_id = match executed_order {
-                                order::Order::LimitMarket(order) => order.id,
-                                order::Order::StopLimit(order) => order.id,
-                            };
-                            matched_orders.into_iter().map(move |next_matched_order| {
-                                let mut float_buf = Vec::new();
-                                dtoa::write(
+                    .into_iter()
+                    .flat_map(|(executed_order, matched_orders)| {
+                        let executed_order_id = match executed_order {
+                            order::Order::LimitMarket(order) => order.id,
+                            order::Order::StopLimit(order) => order.id,
+                        };
+                        matched_orders.into_iter().map(move |next_matched_order| {
+                            let mut float_buf = Vec::new();
+                            dtoa::write(
                                 &mut float_buf,
                                 next_matched_order.limit_price.unwrap().into_inner(),
-                            )
-                            .expect(
-                                "Unexpected floating value while deseralizing trades for database copy",
-                            );
+                                )
+                                .expect(
+                                    "Unexpected floating value while deseralizing trades for database copy",
+                                    );
 
-                                let mut buf = [
-                                    executed_order_id.to_string(),
-                                    next_matched_order.id.to_string(),
-                                    next_matched_order.volume.to_string(),
-                                    String::from_utf8(float_buf).unwrap(),
-                                    next_matched_order.created_at.to_string(),
-                                    next_matched_order.filled_at.unwrap().to_rfc3339(),
-                                ]
+                            let mut buf = [
+                                executed_order_id.to_string(),
+                                next_matched_order.id.to_string(),
+                                next_matched_order.volume.to_string(),
+                                String::from_utf8(float_buf).unwrap(),
+                                next_matched_order.created_at.to_string(),
+                                next_matched_order.filled_at.unwrap().to_rfc3339(),
+                            ]
                                 .join("\t");
-                                buf.push('\n');
-                                buf.into_bytes()
-                            })
-                        });
+                            buf.push('\n');
+                            buf.into_bytes()
+                        })
+                    });
                 iter_ok(rows_iter)
             },
-        )
-        .flatten()
-        .map_err(errors::DatabaseError::ChannelError);
+            )
+                .flatten()
+                .map_err(errors::DatabaseError::ChannelError);
 
     database::copy_into_database(
         "trades".to_string(),
@@ -282,12 +284,10 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         &String::from_utf8(Vec::from(username.unwrap()))
                             .expect("Corrupted password in database!"),
                     );
-                    
+
                     //TODO: Passwords are checked without hashing. Needs to be implemented!
-                    if headers.header_is(
-                        "Password",
-                        passphrase_entry.unwrap_or(&String::from("")) 
-                    ) {
+                    if headers.header_is("Password", passphrase_entry.unwrap_or(&String::from("")))
+                    {
                         return Ok(Some(vec![(auth_resp, String::from("Authorized"))]));
                     }
                 }
@@ -357,27 +357,24 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                                 let buy_sell = order_reader.get_buy();
                                 let volume = order_reader.get_volume();
 
-                                let order_to_process = if let Some((trigger_price, condition)) =
-                                    c_info_opt
-                                {
-                                    order::Order::StopLimit(order::ConditionalOrder::new(
-                                        new_order_id,
-                                        buy_sell,
-                                        volume,
-                                        l_price_opt,
-                                        condition,
-                                        trigger_price,
-                                    ))
-                                } else {
-                                    order::Order::LimitMarket(
-                                        order::UnconditionalOrder::new(
+                                let order_to_process =
+                                    if let Some((trigger_price, condition)) = c_info_opt {
+                                        order::Order::StopLimit(order::ConditionalOrder::new(
                                             new_order_id,
                                             buy_sell,
                                             volume,
                                             l_price_opt,
-                                        ),
-                                    )
-                                };
+                                            condition,
+                                            trigger_price,
+                                        ))
+                                    } else {
+                                        order::Order::LimitMarket(order::UnconditionalOrder::new(
+                                            new_order_id,
+                                            buy_sell,
+                                            volume,
+                                            l_price_opt,
+                                        ))
+                                    };
 
                                 Ok((order_to_process, asset_id))
                             }
