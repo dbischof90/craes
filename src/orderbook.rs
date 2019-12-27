@@ -101,32 +101,48 @@ fn trade_orders(
         // limit order resolution as the last step.
         if let Some(existing_stop_order) = active_stop_book.peek() {
             if limit_price_priority_f32 >= existing_stop_order.trigger_price.into_inner() * ls {
-                let stop_order_to_execute = active_stop_book.pop().unwrap();
-                let (converted_limit_order, stop_order_complement) = stop_order_to_execute.into();
+                match existing_stop_order.condition {
+                    ConditionalType::StopAndReverse => { 
+                        let stop_order_to_execute = active_stop_book.pop().unwrap();
+                        let (converted_limit_order, stop_order_complement) =
+                            stop_order_to_execute.into();
 
-                // Extends the stack to the heap in case an overflow is apparent.
-                stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
-                    match stop_order_complement.condition {
-                        ConditionalType::StopAndReverse => trade_orders(
-                            converted_limit_order,
-                            Some(stop_order_complement),
-                            trades,
-                            backlog_limit_book,
-                            active_limit_book,
-                            backlog_stop_book,
-                            active_stop_book,
-                        ),
-                        ConditionalType::StopLoss => trade_orders(
-                            converted_limit_order,
-                            Some(stop_order_complement),
-                            trades,
-                            active_limit_book,
-                            backlog_limit_book,
-                            active_stop_book,
-                            backlog_stop_book,
-                        ),
+                        // Extends the stack to the heap in case an overflow is apparent.
+                        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+                            trade_orders(
+                                converted_limit_order,
+                                Some(stop_order_complement),
+                                trades,
+                                backlog_limit_book,
+                                active_limit_book,
+                                backlog_stop_book,
+                                active_stop_book,
+                            )
+                        })
                     }
-                })
+                    ConditionalType::StopLoss => {
+                        if let Some(nlo) = active_limit_book.peek() {
+                            if existing_stop_order.trigger_price.into_inner() * ls
+                                <= nlo.limit_price.unwrap().into_inner() * ls
+                            {
+                                let stop_order_to_execute = active_stop_book.pop().unwrap();
+                                let (converted_limit_order, stop_order_complement) =
+                                    stop_order_to_execute.into();
+                                stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+                                    trade_orders(
+                                        converted_limit_order,
+                                        Some(stop_order_complement),
+                                        trades,
+                                        active_limit_book,
+                                        backlog_limit_book,
+                                        active_stop_book,
+                                        backlog_stop_book,
+                                    )
+                                })
+                            }
+                        }
+                    }
+                }
             }
         }
 

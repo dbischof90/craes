@@ -1,7 +1,7 @@
 
 # CRAES 
 ## A centralized asset exchange implemented in Rust
-CRAES stands for _Centralized Rust Asset Exchange Software_ and aims to provide a stable and scalable high-performance asset exchange. 
+CRAES stands for _Centralized Rust Asset Exchange Software_ and aims to provide a fully asynchronous, stable and scalable high-performance asset exchange.
 
 ## Installation and requirements
 A few requirements are assumed present on he build system:
@@ -43,13 +43,17 @@ OPTIONS:
 	--database-name <database-name>		Database name. [default: craes]
 	--database-port	<database-port>		Database port. [default: 5432]
 	--database-user	<database-user>		Database user name. [default: postgres]
-	--server-addr <server-addr>		Address the server will listen on. [default: 127.0.0.1]
+	--server-addr <server-addr>		    Address the server will listen on. [default: 127.0.0.1]
 	--server-port <server-port> 		Server port. [default: 8080]
 ```
 
-CRAES yields an structured and event-based diagnostic log to STDOUT which yields information on connection attempts, trading events and potential important information that helps to debug connection problems of clients during runtime or other unexpected events. Currently there is no option to set the verbosity of the log.
+CRAES yields an structured and event-based diagnostic log to STDOUT which contains information on connection attempts, trading events and potential important information that helps to debug connection problems of clients during runtime or other unexpected events. Currently there is no option to set the verbosity of the log.
 
 ## Clients
 CRAES uses the `capnproto` protocol for communication, opening potential client implementations to many implementations such as Rust (naturally), C++, Go, Python, OCaml and many more. A list of currently available compiler implementations can be found at https://capnproto.org/otherlang.html . 
 Orders are sent to the exchange as serialized messages over a websocket connection. To accept the handshake, CRAES looks for two additional headers in the HTTP request, namely `User` and `Passphrase`. If those match an entry in the `user_info` database, CRAES accepts the connection request and the client can start submitting orders. As of now, the response protocol is only composed out of a list of executed volumes at certain prices which were triggered by the order.
-More verbose communication and an RPC protocol are still planned.
+More verbose communication and an RPC protocol for functions like order book querying are still planned.
+
+## Order types
+Currently, six different order types are supported: **Market** and **Limit** order versions of **unconditional** (e.g. the standard, well-known market and limit orders), **stop** and **stop-and-reverse** order types. The stop-type orders are implemented in a **strictly prioritizing** manner: If an order is able to fill multiple orders and a stop order becomes eligible, the trade resolution of the initial order is interrupted and the stop order is prioritized. As a stop order triggers another market or limit order, those can trigger other conditional orders as well.
+As of now, only immediate trades executed by unconditional orders are reported back immediately to the clients.

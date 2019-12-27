@@ -16,16 +16,15 @@ pub enum Order {
 #[derive(Debug)]
 pub struct OrderComplement {
     pub trigger_price: ordered_float::OrderedFloat<f32>,
-    pub condition: ConditionalType
+    pub condition: ConditionalType,
 }
-
 
 /// A type compositor for conditional orders. Specializes order type and allows specific treatment
 /// in resolution.
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
 pub enum ConditionalType {
     StopLoss,
-    StopAndReverse
+    StopAndReverse,
 }
 
 /// Unconditional orders. These orders can be either limit orders
@@ -136,10 +135,17 @@ impl Hash for ConditionalOrder {
 
 impl From<ConditionalOrder> for (UnconditionalOrder, OrderComplement) {
     fn from(stop_order: ConditionalOrder) -> Self {
+        // Determine unconditional order information
+        let buy = if let ConditionalType::StopLoss = stop_order.condition {
+            !stop_order.buy
+        } else {
+            stop_order.buy
+        };
+
         (
             UnconditionalOrder {
                 limit_price: stop_order.limit_price,
-                buy: stop_order.buy,
+                buy,
                 id: stop_order.id,
                 volume: stop_order.volume,
                 created_at: stop_order.created_at,
@@ -147,7 +153,7 @@ impl From<ConditionalOrder> for (UnconditionalOrder, OrderComplement) {
             },
             OrderComplement {
                 trigger_price: stop_order.trigger_price,
-                condition: stop_order.condition
+                condition: stop_order.condition,
             },
         )
     }
@@ -155,15 +161,22 @@ impl From<ConditionalOrder> for (UnconditionalOrder, OrderComplement) {
 
 impl From<(UnconditionalOrder, OrderComplement)> for ConditionalOrder {
     fn from(order_tuple: (UnconditionalOrder, OrderComplement)) -> Self {
+        // Parse complementary information
+        let buy = if let ConditionalType::StopLoss = order_tuple.1.condition {
+            !order_tuple.0.buy
+        } else {
+            order_tuple.0.buy
+        };
+
         ConditionalOrder {
             limit_price: order_tuple.0.limit_price,
-            buy: order_tuple.0.buy,
+            buy,
             id: order_tuple.0.id,
             volume: order_tuple.0.volume,
             created_at: order_tuple.0.created_at,
             filled_at: None,
             trigger_price: order_tuple.1.trigger_price,
-            condition: order_tuple.1.condition
+            condition: order_tuple.1.condition,
         }
     }
 }

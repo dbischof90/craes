@@ -52,7 +52,7 @@ pub fn copy_into_database<S>(
     .map_err(errors::DatabaseError::ClientError)
     .and_then(|(mut client, statement)| {
         lines_stream
-            .chunks(2)
+            .chunks(500)
             .and_then(move |prepared_rows| {
                 debug!("Writing {} lines", &prepared_rows.len());
                 let stream_rows = iter_ok::<_, std::io::Error>(prepared_rows);

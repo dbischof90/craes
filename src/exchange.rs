@@ -120,7 +120,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
         .map(
             |executed_trades: std::collections::HashMap<
             order::Order,
-            std::vec::Vec<order::UnconditionalOrder>,
+            Vec<order::UnconditionalOrder>,
             >| {
                 let rows_iter =
                     executed_trades
@@ -181,7 +181,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
             order::Order,
             sync::oneshot::Sender<
                 std::result::Result<
-                    std::vec::Vec<order::UnconditionalOrder>,
+                    Vec<order::UnconditionalOrder>,
                     errors::AssetHandlingError,
                 >,
             >,
@@ -209,7 +209,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
             .for_each(move |(processed_order, trades, os_tx)| {
                 let own_executed_trades = match trades.get(&processed_order) {
                     Some(t) => t.clone(),
-                    None => std::vec::Vec::new(),
+                    None => Vec::new(),
                 };
                 debug!(
                     "Order triggered {} trades for client.",
@@ -385,7 +385,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                     .and_then(move |(order_to_process, asset_id)| {
                         let (tx_os, rx_os) = futures::sync::oneshot::channel::<
                             std::result::Result<
-                                std::vec::Vec<order::UnconditionalOrder>,
+                                Vec<order::UnconditionalOrder>,
                                 errors::AssetHandlingError,
                             >,
                         >();
@@ -395,8 +395,8 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         conn_for_client
                             .read()
                             .unwrap()
-                            .get(&asset_id)
-                            .map(|channel| channel.clone())
+                            .get(&asset_id).cloned()
+                            //.map(|channel| channel.clone())
                             .ok_or(errors::ServerError::AssetDoesNotExist)
                             .and_then(|tx_local| {
                                 Ok(tx_local
@@ -428,7 +428,7 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         }
 
                         capnp_futures::serialize::write_message(
-                            std::io::Cursor::new(std::vec::Vec::new()),
+                            std::io::Cursor::new(Vec::new()),
                             response_builder,
                         )
                         .map_err(errors::ServerError::DeserializationError)
@@ -454,10 +454,14 @@ pub fn operate_exchange(config: Config) -> Result<(), Box<dyn std::error::Error>
                         Ok(())
                     })
                     .or_else(move |e| {
-                        error!(
-                            "Failed response to {}, dropping connection. Reason: {:?}",
-                            addr, e
-                        );
+                        if let tungstenite::error::Error::ConnectionClosed = e {
+                            info!("Client at {} closed connection.", addr);
+                        } else {
+                            error!(
+                                "Failed response to {}, dropping connection. Reason: {:?}",
+                                addr, e
+                            )
+                        };
                         Ok(())
                     })
             })
